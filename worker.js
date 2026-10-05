@@ -1,22 +1,22 @@
-// Arc Pulse — API + dasbor Arc mainnet (chain 5042) yang bisa dibaca agen.
+// Arc Pulse — API + dashboard for Arc mainnet (chain 5042), readable by agents.
 //
-// Kenapa ini ada: papan bounty ArcBounty hanya menyajikan statistiknya di browser
-// (dibaca langsung dari kontrak), dan facade resminya hanya melayani Arc *Testnet*
-// serta berbayar. Tidak ada REST API publik untuk Arc mainnet. Worker ini menutup
-// celah itu: data kontrak Arc mainnet yang sudah didekode, siap dibaca agen.
+// Why this exists: the ArcBounty board renders its stats client-side in a browser
+// (read straight from the contract), and the official facade only serves Arc *Testnet*
+// and is paywalled. There was no public REST API for Arc mainnet. This Worker closes
+// that gap: decoded Arc mainnet contract data, ready for agents to consume.
 //
 // Cakupannya dua sisi ekonomi agen di Arc:
-//   1. ArcBounty  — papan bounty USDC (ERC-8183 escrow)
+//   1. ArcBounty  — the USDC bounty board (ERC-8183 escrow)
 //   2. ERC-8004   — IdentityRegistry: identitas agen (ERC-721 + agentWallet + agentURI)
 //
-// Semua pembacaan read-only lewat eth_call — tanpa kunci, tanpa gas, tanpa akun.
+// Every read is a read-only eth_call — no key, no gas, no account.
 import {
   ARC, network, totalBounties, getBountyMeta, allBountyMetas,
   usdcTotalSupply, agentRows, agentCount, registryName,
 } from './abi.js'
 
 const CACHE_SECONDS = 20
-const AGENT_COUNT_TTL = 600 // detik; jumlah agen berubah lambat, pencarian biner itu mahal
+const AGENT_COUNT_TTL = 600 // seconds; the agent count changes slowly and the search is expensive
 const MAX_AGENTS_PER_PAGE = 60
 
 const json = (data, status = 200, extra = {}) =>
@@ -30,7 +30,7 @@ const json = (data, status = 200, extra = {}) =>
     },
   })
 
-// Cache API dipakai untuk nilai yang mahal dihitung tapi jarang berubah.
+// The Cache API holds values that are expensive to compute but rarely change.
 async function cached(key, ttl, fn) {
   try {
     const cache = caches.default
@@ -46,19 +46,19 @@ async function cached(key, ttl, fn) {
     )
     return val
   } catch {
-    return await fn() // kalau Cache API tidak tersedia, tetap jalan
+    return await fn() // if the Cache API is unavailable, carry on anyway
   }
 }
 
 // --- ArcBounty ---
 
 async function board() {
-  // Seluruh riwayat dalam satu batch. Saat ini yang terbuka nol dan semuanya resolved,
-  // jadi endpoint "open saja" akan tampak seperti API rusak — riwayatnya yang berisi.
+  // The whole history in one batch. Right now zero are open and all are resolved,
+  // so an "open only" endpoint would look like a broken API — the history is the content.
   const [n, total, all] = await Promise.all([network(), totalBounties(), allBountyMetas()])
   const open = all.filter((b) => b.status === 'open' && b.rewardUsdc > 0)
   const resolved = all.filter((b) => b.resolved)
-  const jumlah = (a) => Number(a.reduce((s, b) => s + b.rewardUsdc, 0).toFixed(6))
+  const sumUsdc = (a) => Number(a.reduce((s, b) => s + b.rewardUsdc, 0).toFixed(6))
   return {
     network: n,
     total: Number(total),
@@ -70,8 +70,8 @@ async function board() {
       resolved: resolved.length,
       taken: all.filter((b) => b.isTaken).length,
       agentOnly: all.filter((b) => b.agentOnly).length,
-      openRewardUsdc: jumlah(open),
-      resolvedRewardUsdc: jumlah(resolved),
+      openRewardUsdc: sumUsdc(open),
+      resolvedRewardUsdc: sumUsdc(resolved),
     },
   }
 }
@@ -92,7 +92,7 @@ async function stats() {
       address: ARC.usdc,
       totalSupplyUsdc: Number(sup) / 1e6,
       decimals: 6,
-      note: 'Antarmuka ERC-20 6 desimal di atas USDC native Arc; USDC juga gas token di Arc.',
+      note: 'ERC-20 6-decimal interface over Arc native USDC; USDC is also the gas token on Arc.',
     },
     arcbounty: {
       adapter: ARC.adapter,
@@ -108,13 +108,13 @@ async function stats() {
   }
 }
 
-// --- ERC-8004: metadata agent ---
+// --- ERC-8004: agent metadata ---
 
-// Gateway IPFS publik. Urutan ini terukur, bukan tebakan:
+// Public IPFS gateways. This order is measured, not guessed:
 //   ipfs.io / dweb.link  → HTTP 429 "switching to a service worker gateway only"
-//                          (mati untuk fetch server-side sejak 2025)
+//                          (dead for server-side fetches since 2025)
 //   filebase             → 200 application/json, CIDv0 & CIDv1
-// Jadi filebase dulu, sisanya cadangan.
+// So filebase goes first and the rest are fallbacks.
 const IPFS_GATEWAYS = ['https://ipfs.filebase.io/ipfs/', 'https://dweb.link/ipfs/', 'https://ipfs.io/ipfs/']
 const UA = 'arc-pulse/2.0 (+https://arc-pulse.kaminariouji.workers.dev/skill.md)'
 const TEXTUAL = /^(application\/(json|[a-z0-9.+-]+\+json|xml|[a-z0-9.+-]+\+xml)|text\/)/i
@@ -122,8 +122,8 @@ const TEXTUAL = /^(application\/(json|[a-z0-9.+-]+\+json|xml|[a-z0-9.+-]+\+xml)|
 const ipfsCid = (uri) => uri.replace(/^ipfs:\/\/(ipfs\/)?/, '')
 const gatewayUrls = (cid) => IPFS_GATEWAYS.map((g) => g + cid)
 
-// Ambil URI apa pun dengan rantai fallback. Mengembalikan { kind, ... } — tidak pernah melempar,
-// karena agentURI yang rusak itu hal biasa di dunia nyata, bukan kondisi luar biasa.
+// Fetch any URI through a fallback chain. Returns { kind, ... } — never throws,
+// because a broken agentURI is ordinary in the real world, not an exceptional condition.
 async function fetchAgentURI(uri, ms = 8000) {
   const urls = uri.startsWith('ipfs://') ? gatewayUrls(ipfsCid(uri)) : [uri]
   const attempts = []
@@ -136,7 +136,7 @@ async function fetchAgentURI(uri, ms = 8000) {
       if (!r.ok) { attempts.push(url + ' → HTTP ' + r.status); continue }
       const ct = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
       if (!TEXTUAL.test(ct)) {
-        // Jangan buang isi biner ke JSON — laporkan saja jenis dan ukurannya.
+        // Do not dump binary into JSON — just report its type and size.
         const bytes = (await r.arrayBuffer()).byteLength
         return { kind: 'binary', url, contentType: ct || 'unknown', bytes }
       }
@@ -150,16 +150,16 @@ async function fetchAgentURI(uri, ms = 8000) {
   return { kind: 'error', uri, attempts }
 }
 
-// agentURI boleh berupa data: URI, ipfs://, atau https://. Semua diubah jadi objek.
+// agentURI may be a data: URI, ipfs:// or https://. All are turned into an object.
 async function resolveAgentURI(uri) {
   if (!uri) return null
   if (!uri.startsWith('data:')) return fetchAgentURI(uri)
 
   const m = uri.match(/^data:([^;,]*)(;base64)?,([\s\S]*)$/)
-  if (!m) return { kind: 'data', error: 'data: URI tidak bisa diurai', raw: uri.slice(0, 300) }
+  if (!m) return { kind: 'data', error: 'unparseable data: URI', raw: uri.slice(0, 300) }
   const contentType = m[1] || 'text/plain'
   let body
-  try { body = m[2] ? atob(m[3]) : decodeURIComponent(m[3]) } catch { return { kind: 'data', contentType, error: 'isi data: tidak bisa didekode' } }
+  try { body = m[2] ? atob(m[3]) : decodeURIComponent(m[3]) } catch { return { kind: 'data', contentType, error: 'data: payload could not be decoded' } }
   try { return { kind: 'data', contentType, json: JSON.parse(body) } } catch { return { kind: 'data', contentType, raw: body.slice(0, 2000) } }
 }
 
@@ -173,7 +173,7 @@ async function agentsPage(offset, limit) {
   return { total, offset, limit, count: rows.length, agents: rows }
 }
 
-// --- halaman HTML ---
+// --- HTML page ---
 
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 const short = (a) => (a && a !== '0x0000000000000000000000000000000000000000' ? a.slice(0, 8) + '…' + a.slice(-4) : '—')
@@ -228,7 +228,7 @@ a{color:var(--acc)}code{background:#161b22;padding:1px 6px;border-radius:5px;fon
 footer{margin-top:44px;color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:18px}
 </style></head><body><div class="wrap">
 <h1>Arc Pulse</h1>
-<p class="sub">Arc mainnet (chain 5042), dibaca langsung dari kontrak dan RPC publik. Read-only, tanpa akun, tanpa kunci — dirancang supaya agen bisa mengonsumsinya.</p>
+<p class="sub">Arc mainnet (chain 5042), read straight from contracts and a public RPC. Read-only, no account, no key — built so agents can consume it.</p>
 
 <div class="grid">
   <div class="card"><div class="k">Block</div><div class="v">${b.network.block.toLocaleString('en-US')}</div></div>
@@ -240,19 +240,19 @@ footer{margin-top:44px;color:var(--dim);font-size:13px;border-top:1px solid var(
 </div>
 
 <h2>ArcBounty board <span class="dimtxt">(all ${b.summary.posted} — ${b.summary.open} open, ${b.summary.resolved} resolved)</span></h2>
-${b.all.length ? `<table><thead><tr><th>Job</th><th>Reward</th><th>Category</th><th>Tags</th><th>Access</th><th>Status</th><th>Deadline</th><th>Poster</th></tr></thead><tbody>${rows}</tbody></table>` : '<p class="sub">Papan kosong.</p>'}
+${b.all.length ? `<table><thead><tr><th>Job</th><th>Reward</th><th>Category</th><th>Tags</th><th>Access</th><th>Status</th><th>Deadline</th><th>Poster</th></tr></thead><tbody>${rows}</tbody></table>` : '<p class="sub">Board is empty.</p>'}
 
 <h2>ERC-8004 agent identities <span class="dimtxt">(first ${agents.count} of ${agents.total})</span></h2>
-${agents.agents.length ? `<table><thead><tr><th>Agent</th><th>Owner</th><th>Agent wallet</th><th>agentURI</th></tr></thead><tbody>${arows}</tbody></table>` : '<p class="sub">Registry kosong.</p>'}
+${agents.agents.length ? `<table><thead><tr><th>Agent</th><th>Owner</th><th>Agent wallet</th><th>agentURI</th></tr></thead><tbody>${arows}</tbody></table>` : '<p class="sub">Registry is empty.</p>'}
 
 <h2>API</h2>
 <div class="end">
-  <div><code>GET /api/stats</code> — jaringan, gas, supply USDC, jumlah bounty, jumlah agent terdaftar</div>
-  <div><code>GET /api/bounties</code> — seluruh papan ArcBounty; <code>?status=open|resolved|all</code></div>
-  <div><code>GET /api/bounties/:id</code> — satu bounty; tambahkan <code>?full=1</code> untuk menarik teks deskripsi dari IPFS</div>
-  <div><code>GET /api/agents</code> — identitas agent ERC-8004 (owner, agent wallet, agentURI)</div>
-  <div><code>GET /api/agents/:id</code> — satu agent; <code>?resolve=1</code> untuk mengambil dan mendekode agentURI-nya</div>
-  <div><code>POST /mcp</code> — server MCP: tool yang sama, bisa dipanggil agen AI mana pun</div>
+  <div><code>GET /api/stats</code> — network, gas, USDC supply, bounty totals, registered agent count</div>
+  <div><code>GET /api/bounties</code> — the whole ArcBounty board; <code>?status=open|resolved|all</code></div>
+  <div><code>GET /api/bounties/:id</code> — one bounty; add <code>?full=1</code> to pull the task text from IPFS</div>
+  <div><code>GET /api/agents</code> — ERC-8004 agent identities (owner, agent wallet, agentURI)</div>
+  <div><code>GET /api/agents/:id</code> — one agent; <code>?resolve=1</code> to fetch and decode its agentURI</div>
+  <div><code>POST /mcp</code> — MCP server: the same tools, callable by any AI agent</div>
   <div><code>GET /openapi.json</code> · <code>/skill.md</code> · <code>/llms.txt</code></div>
 </div>
 
@@ -319,7 +319,7 @@ async function mcpCallTool(name, args = {}) {
     }
     case 'arc_bounty': {
       const id = Number(args.id)
-      if (!Number.isInteger(id) || id < 0) throw new Error('id harus bilangan bulat')
+      if (!Number.isInteger(id) || id < 0) throw new Error('id must be an integer')
       const b = await getBountyMeta(id)
       if (args.full && b.descriptionCid) b.descriptionText = await ipfsText(b.descriptionCid)
       return text(b)
@@ -331,14 +331,14 @@ async function mcpCallTool(name, args = {}) {
     }
     case 'arc_agent': {
       const id = Number(args.id)
-      if (!Number.isInteger(id) || id < 1) throw new Error('id harus bilangan bulat >= 1')
+      if (!Number.isInteger(id) || id < 1) throw new Error('id must be an integer >= 1')
       const rows = (await agentRows([id])).filter(Boolean)
-      if (!rows.length) throw new Error('agent #' + id + ' tidak ada')
+      if (!rows.length) throw new Error('no such agent #' + id)
       const a = rows[0]
       if (args.resolve) a.metadata = await resolveAgentURI(a.agentURI)
       return text(a)
     }
-    default: throw new Error('tool tidak dikenal: ' + name)
+    default: throw new Error('unknown tool: ' + name)
   }
 }
 
@@ -371,7 +371,7 @@ async function mcp(request) {
       }
     }
     if (method === 'ping') return { jsonrpc: '2.0', id, result: {} }
-    if (/^notifications\//.test(method)) return null // notifikasi tidak dibalas
+    if (/^notifications\//.test(method)) return null // notifications are not answered
     return { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found: ' + method } }
   }
 
@@ -396,7 +396,7 @@ async function ipfsText(cid) {
   return null
 }
 
-// --- spesifikasi untuk agen ---
+// --- specifications for agents ---
 
 const OPENAPI = {
   openapi: '3.1.0',

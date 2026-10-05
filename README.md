@@ -78,10 +78,12 @@ Five tools: `arc_stats`, `arc_bounties`, `arc_bounty`, `arc_agents`, `arc_agent`
 As of the last deployment, read straight off Arc mainnet:
 
 - **1,419** registered ERC-8004 agent identities (`AgentIdentity` / `AGENT`), ids 1–1419 with **zero gaps** — verified by scanning every id, not by trusting the highest one.
-- **16** bounties ever posted on ArcBounty; **15 resolved**, 0 currently open, **38 USDC** in resolved rewards.
+- **15** bounties ever posted on ArcBounty; all 15 resolved, 0 currently open, **38 USDC** in resolved rewards.
 - USDC total supply: ~511M.
 
 The board having zero open bounties is *why* `/api/bounties` defaults to `status=all`. An endpoint that only returns open bounties would return an empty array and look broken.
+
+`totalBounties()` reports **16** while only 15 bounties exist: the contract counts slot 0, which was never filled. `getBountyMeta` does not revert for an unused id — it returns a zeroed struct — so "the call succeeded" is not a usable filter. `allBountyMetas()` filters on `deadline > 0` instead.
 
 ## What it uses Arc for
 
@@ -114,7 +116,7 @@ Decoding an array of dynamic types is easy to get subtly wrong: each element's o
 
 ### Counting agents
 
-`ownerOf` reverts with `ERC721NonexistentToken` for ids that were never minted, so "how many agents exist" is a search problem, not a `totalSupply()` call — the registry exposes no counter. `agentCount()` probes powers of two in a single batch, then binary-searches the gap: ~11 requests. `cek-celah.mjs` independently scans *every* id to confirm the count equals the highest id (no burns, no gaps).
+`ownerOf` reverts with `ERC721NonexistentToken` for ids that were never minted, so "how many agents exist" is a search problem, not a `totalSupply()` call — the registry exposes no counter. `agentCount()` probes powers of two in a single batch, then binary-searches the gap: ~11 requests. `verify-no-gaps.mjs` independently scans *every* id to confirm the count equals the highest id (no burns, no gaps).
 
 ## Files
 
@@ -122,16 +124,16 @@ Decoding an array of dynamic types is easy to get subtly wrong: each element's o
 |---|---|
 | `worker.js` | Cloudflare Worker: routing, MCP server, JSON shaping, OpenAPI/skill/llms docs, HTML dashboard |
 | `abi.js` | Hand-written ABI encoder/decoder + Arc RPC helpers (batching, agent enumeration) |
-| `uji.mjs` | End-to-end test suite — 30 assertions across REST, MCP, docs and error paths. Takes an optional base URL. |
-| `cek-celah.mjs` | Independent audit: scans every agent id to prove the count has no gaps |
+| `test-api.mjs` | End-to-end test suite — 31 assertions across REST, MCP, docs and error paths. Takes an optional base URL. |
+| `verify-no-gaps.mjs` | Independent audit: scans every agent id to prove the count has no gaps |
 | `test-abi.mjs` | Smoke test that runs the ABI module against live Arc mainnet |
 | `wrangler.toml` | Worker config |
 
 ## Test
 
 ```bash
-node uji.mjs                                        # against local wrangler dev
-node uji.mjs https://arc-pulse.kaminariouji.workers.dev   # against production
+node test-api.mjs                                        # against local wrangler dev
+node test-api.mjs https://arc-pulse.kaminariouji.workers.dev   # against production
 ```
 
 ## Deploy your own

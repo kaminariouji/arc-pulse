@@ -2,6 +2,6 @@ name = "arc-pulse"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
-# Arc Pulse — API + dasbor Arc mainnet (chain 5042) yang bisa dibaca agen.
-# Read-only: hanya eth_call ke RPC publik, tidak menyimpan kunci, tidak mengirim transaksi.
+# Arc Pulse — API + dashboard for Arc mainnet (chain 5042), readable by agents.
+# Read-only: only eth_call against a public RPC. Stores no keys, sends no transactions.
 observability = { enabled = true }

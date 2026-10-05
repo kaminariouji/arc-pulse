@@ -19,6 +19,17 @@ export const SEL = {
   totalSupply: '0x18160ddd',
 }
 
+// ERC-8004 IdentityRegistry (AgentIdentity / AGENT). Ini kontrak ERC-1967 proxy:
+// alamat di ARC.identityRegistry hanyalah proxy; implementasinya dibaca dari slot
+// 0x360894a1…bbc. Semua fungsi di bawah dipanggil ke alamat PROXY.
+export const SEL8004 = {
+  ownerOf: '0x6352211e',
+  tokenURI: '0xc87b56dd',
+  getAgentWallet: '0x00339509',
+  name: '0x06fdde03',
+  symbol: '0x95d89b41',
+}
+
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 
@@ -193,8 +204,167 @@ export async function getBountyMeta(id) {
   return decodeBountyMeta(await call(ARC.adapter, SEL.getBountyMeta + encUint(id)))
 }
 
+// Seluruh riwayat papan: id 0..total-1. Papan ArcBounty kecil (belasan bounty),
+// jadi menarik semuanya masih satu batch dan jauh lebih informatif daripada
+// hanya yang terbuka — saat ini yang terbuka nol, jadi filter itu menampilkan hampa.
+export async function allBountyMetas() {
+  const total = Number(await totalBounties())
+  if (total <= 0) return []
+  const ids = []
+  for (let i = 0; i < total; i++) ids.push(i)
+  const metas = await bountyMetas(ids)
+  return metas.filter(Boolean)
+}
+
 export async function usdcTotalSupply() {
   return BigInt(await call(ARC.usdc, SEL.totalSupply))
+}
+
+// --- ERC-8004 IdentityRegistry ---
+
+// RPC Arc menolak batch > 100 dengan error -32600 ("batch size N exceeds limit of 100").
+// Terukur: 100 lolos, 200 ditolak. Jadi potong sendiri, jangan bergantung pada batas itu.
+export const MAX_BATCH = 100
+
+// Selector error ERC-721 `ERC721NonexistentToken(uint256)` — satu-satunya revert
+// yang dianggap normal di sini (artinya token itu memang belum pernah di-mint).
+const ERC721_NONEXISTENT = '0x7e273289'
+
+// Satu HTTP request untuk banyak eth_call sekaligus (JSON-RPC batch).
+// Penting di Cloudflare Workers: batas subrequest per request itu ketat.
+//
+// Kontrak fungsi ini: null berarti "tidak ada data" HANYA kalau RPC memang bilang
+// begitu. Kegagalan transport atau error tak terduga DILEMPAR, tidak pernah jadi null —
+// supaya "agent tidak ada" tidak pernah tertukar dengan "RPC sedang rusak".
+export async function callBatch(requests, timeoutMs = 20000) {
+  if (!requests.length) return []
+  const out = new Array(requests.length).fill(null)
+
+  for (let i = 0; i < requests.length; i += MAX_BATCH) {
+    const part = requests.slice(i, i + MAX_BATCH)
+    const body = part.map((r, k) => ({
+      jsonrpc: '2.0',
+      id: k + 1,
+      method: 'eth_call',
+      params: [{ to: r.to, data: r.data }, 'latest'],
+    }))
+    const ctl = new AbortController()
+    const t = setTimeout(() => ctl.abort(), timeoutMs)
+    let arr
+    try {
+      const res = await fetch(ARC.rpc, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      })
+      const j = await res.json()
+      // Batch yang ditolak dijawab objek tunggal (HTTP 200!) — jangan dianggap "kosong".
+      if (!Array.isArray(j)) throw new Error('RPC menolak batch: ' + JSON.stringify(j).slice(0, 200))
+      arr = j
+    } finally {
+      clearTimeout(t)
+    }
+
+    const byId = new Map(arr.map((x) => [x.id, x]))
+    for (let k = 0; k < part.length; k++) {
+      const x = byId.get(k + 1)
+      if (!x) throw new Error('RPC tidak menjawab permintaan #' + (i + k))
+      if (x.error) {
+        const d = typeof x.error.data === 'string' ? x.error.data : ''
+        if (d.startsWith(ERC721_NONEXISTENT)) continue // token belum di-mint
+        throw new Error('eth_call gagal: ' + String(x.error.message || '').slice(0, 160))
+      }
+      // '0x' = alamat tanpa kode / tidak mengembalikan apa pun → tetap null.
+      if (x.result && x.result !== '0x') out[i + k] = x.result
+    }
+  }
+  return out
+}
+
+// getBountyMeta untuk banyak id dalam satu subrequest (sebelumnya satu per id).
+export async function bountyMetas(ids) {
+  const out = await callBatch(ids.map((id) => ({ to: ARC.adapter, data: SEL.getBountyMeta + encUint(id) })))
+  return out.map((hex) => {
+    if (!hex) return null
+    try { return decodeBountyMeta(hex) } catch { return null }
+  })
+}
+
+const uintArg = (v) => encUint(v)
+
+export async function agentOwner(id) {
+  return decAddr(await call(ARC.identityRegistry, SEL8004.ownerOf + uintArg(id)), 0)
+}
+
+export async function agentWallet(id) {
+  return decAddr(await call(ARC.identityRegistry, SEL8004.getAgentWallet + uintArg(id)), 0)
+}
+
+export async function agentURI(id) {
+  return decString(await call(ARC.identityRegistry, SEL8004.tokenURI + uintArg(id)), 32)
+}
+
+// Ambil owner+wallet+URI untuk sekumpulan id dalam SATU subrequest.
+export async function agentRows(ids) {
+  const reqs = []
+  for (const id of ids) {
+    reqs.push({ to: ARC.identityRegistry, data: SEL8004.ownerOf + uintArg(id) })
+    reqs.push({ to: ARC.identityRegistry, data: SEL8004.getAgentWallet + uintArg(id) })
+    reqs.push({ to: ARC.identityRegistry, data: SEL8004.tokenURI + uintArg(id) })
+  }
+  const out = await callBatch(reqs)
+  return ids.map((id, k) => {
+    const owner = out[k * 3]
+    if (!owner) return null // tokenId belum pernah di-mint
+    const wallet = out[k * 3 + 1]
+    const uri = out[k * 3 + 2]
+    return {
+      agentId: id,
+      owner: decAddr(owner, 0),
+      agentWallet: wallet ? decAddr(wallet, 0) : null,
+      agentURI: uri ? decString(uri, 32) : null,
+    }
+  })
+}
+
+// true = token ada, false = belum pernah di-mint.
+// Kegagalan RPC DILEMPAR lewat callBatch, tidak pernah disamarkan jadi "tidak ada".
+export async function agentExists(ids) {
+  const out = await callBatch(ids.map((id) => ({ to: ARC.identityRegistry, data: SEL8004.ownerOf + uintArg(id) })))
+  return out.map((r) => !!r && r !== '0x')
+}
+
+// Jumlah agent = id terbesar yang ada (mint berurutan dari 1; celahnya diverifikasi
+// terpisah — lihat cek-celah.mjs). Lompatan eksponensial dikirim dalam SATU batch,
+// lalu binary search ~10 langkah.
+export async function agentCount(hi = 16384) {
+  const probes = []
+  for (let v = 1; v <= hi; v *= 2) probes.push(v)
+  const ada = await agentExists(probes)
+
+  let bawah = 0
+  let atas = 0
+  for (let i = 0; i < probes.length; i++) {
+    if (ada[i]) bawah = probes[i]
+    else { atas = probes[i]; break }
+  }
+  if (!atas) return bawah // semua probe ada sampai hi — menyerah, laporkan yang terukur
+  while (bawah + 1 < atas) {
+    const mid = Math.floor((bawah + atas) / 2)
+    const [ok] = await agentExists([mid])
+    if (ok) bawah = mid
+    else atas = mid
+  }
+  return bawah
+}
+
+export async function registryName() {
+  const [n, s] = await Promise.all([
+    call(ARC.identityRegistry, SEL8004.name),
+    call(ARC.identityRegistry, SEL8004.symbol),
+  ])
+  return { name: decString(n, 32), symbol: decString(s, 32) }
 }
 
 export async function network() {
